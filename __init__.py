@@ -11,9 +11,9 @@ if sys.platform == 'win32':
     from win32 import win32crypt #pywin32
 
 try:
-    import cookielib
-except ImportError:
     import http.cookiejar as cookielib
+except ImportError:
+    import cookielib
 from contextlib import contextmanager
 import tempfile
 try:
@@ -97,6 +97,646 @@ class BrowserCookieLoader(object):
 class Chrome(BrowserCookieLoader):
     def __str__(self):
         return 'chrome'
+
+    def find_cookie_files(self):
+        for pattern in [
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Profile */Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Profile */Cookies'),
+            os.path.expanduser('~/.config/chromium/Default/Cookies'),
+            os.path.expanduser('~/.config/chromium/Profile */Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Default/Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Profile */Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Default/Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Profile */Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Network\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Profile *\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Profile *\Cookies'),
+        ]:
+            for result in glob.glob(pattern):
+                yield result
+
+    def get_cookies(self):
+        salt = b'saltysalt'
+        length = 16
+        if sys.platform == 'darwin':
+            # running Chrome on OSX
+            my_pass = keyring.get_password('Chrome Safe Storage', 'Chrome')
+            my_pass = my_pass.encode('utf8')
+            iterations = 1003
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform.startswith('linux'):
+            # running Chrome on Linux
+            my_pass = 'peanuts'.encode('utf8')
+            try:
+                import secretstorage
+
+                bus = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(bus)
+                for item in collection.get_all_items():
+                    if item.get_label() in ['Chromium Safe Storage', 'Chrome Safe Storage']:
+                        my_pass = item.get_secret()
+                        break
+            except Exception as e:
+                print(e)
+
+            iterations = 1
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform == 'win32':
+            path = r'%LocalAppData%\Google\Chrome\User Data\Local State'
+            path = os.path.expandvars(path)
+            with open(path, 'r') as file:
+                encrypted_key = json.loads(file.read())['os_crypt']['encrypted_key']
+            encrypted_key = base64.b64decode(encrypted_key)  # Base64 decoding
+            encrypted_key = encrypted_key[5:]  # Remove DPAPI
+            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]  # Decrypt key
+        else:
+            raise BrowserCookieError('Unsupported operating system: ' + sys.platform)
+
+        for cookie_file in self.cookie_files:
+            with create_local_copy(cookie_file) as tmp_cookie_file:
+                con = sqlite3.connect(tmp_cookie_file)
+                cur = con.cursor()
+                cur.execute('SELECT value FROM meta WHERE key = "version";')
+                version = int(cur.fetchone()[0])
+                query = 'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies;'
+                if version < 10:
+                    query = query.replace('is_', '')
+                cur.execute(query)
+                for item in cur.fetchall():
+                    host, path, secure, expires, name = item[:5]
+                    expires = expires /1e6  - 11644473600 # 1601/1/1
+                    value = self._decrypt(item[5], item[6], item[4], item[1], key=key)
+                    yield create_cookie(host, path, secure, expires, name, value)
+                con.close()
+
+    def _decrypt(self, value, encrypted_value, cookiename, sitename, key):
+
+        """Decrypt encoded cookies
+        """
+        if (sys.platform == 'darwin') or sys.platform.startswith('linux'):
+            if value or (encrypted_value[:3] != b'v10' and encrypted_value[:3] != b'v11'):
+                return value
+
+            # Encrypted cookies should be prefixed with 'v10' or 'v11' according to the
+            # Chromium code. Strip it off.
+            encrypted_value = encrypted_value[3:]
+
+            # Strip padding by taking off number indicated by padding
+            # eg if last is '\x0e' then ord('\x0e') == 14, so take off 14.
+            def clean(x):
+                last = x[-1]
+                if isinstance(last, int):
+                    return x[:-last].decode('utf8')
+                else:
+                    return x[:-ord(last)].decode('utf8')
+
+            iv = b' ' * 16
+            cipher = AES.new(key, AES.MODE_CBC, IV=iv)
+            decrypted = cipher.decrypt(encrypted_value)
+            return clean(decrypted)
+        else:
+            # Must be win32 (on win32, all chrome cookies are encrypted)
+
+            plaintext = ""
+            if encrypted_value[:3] == b'v10':
+                try:
+                    data = encrypted_value # the encrypted cookie
+                    nonce = data[3:3 + 12]
+                    ciphertext = data[3 + 12:-16]
+                    tag = data[-16:]
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")  # the decrypted cookie
+                except:
+                    raise BrowserCookieError("Error decrypting V80+ cookie: " + str(cookiename) + " from site " + str(sitename))
+            else:
+                try:
+                    plaintext = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode("utf-8")
+                except:
+                    raise BrowserCookieError("Error decrypting cookie: " + str(cookiename) + " from site " + str(sitename))
+            return plaintext
+
+
+class Edge(BrowserCookieLoader):
+    def __str__(self):
+        return 'edge'
+
+    def find_cookie_files(self):
+        for pattern in [
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Profile */Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Profile */Cookies'),
+            os.path.expanduser('~/.config/chromium/Default/Cookies'),
+            os.path.expanduser('~/.config/chromium/Profile */Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Default/Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Profile */Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Default/Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Profile */Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Network\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Profile *\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Profile *\Cookies'),
+        ]:
+            for result in glob.glob(pattern):
+                yield result
+
+    def get_cookies(self):
+        salt = b'saltysalt'
+        length = 16
+        if sys.platform == 'darwin':
+            # running Chrome on OSX
+            my_pass = keyring.get_password('Chrome Safe Storage', 'Chrome')
+            my_pass = my_pass.encode('utf8')
+            iterations = 1003
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform.startswith('linux'):
+            # running Chrome on Linux
+            my_pass = 'peanuts'.encode('utf8')
+            try:
+                import secretstorage
+
+                bus = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(bus)
+                for item in collection.get_all_items():
+                    if item.get_label() in ['Chromium Safe Storage', 'Chrome Safe Storage']:
+                        my_pass = item.get_secret()
+                        break
+            except Exception as e:
+                print(e)
+
+            iterations = 1
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform == 'win32':
+            path = r'%LocalAppData%\Google\Chrome\User Data\Local State'
+            path = os.path.expandvars(path)
+            with open(path, 'r') as file:
+                encrypted_key = json.loads(file.read())['os_crypt']['encrypted_key']
+            encrypted_key = base64.b64decode(encrypted_key)  # Base64 decoding
+            encrypted_key = encrypted_key[5:]  # Remove DPAPI
+            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]  # Decrypt key
+        else:
+            raise BrowserCookieError('Unsupported operating system: ' + sys.platform)
+
+        for cookie_file in self.cookie_files:
+            with create_local_copy(cookie_file) as tmp_cookie_file:
+                con = sqlite3.connect(tmp_cookie_file)
+                cur = con.cursor()
+                cur.execute('SELECT value FROM meta WHERE key = "version";')
+                version = int(cur.fetchone()[0])
+                query = 'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies;'
+                if version < 10:
+                    query = query.replace('is_', '')
+                cur.execute(query)
+                for item in cur.fetchall():
+                    host, path, secure, expires, name = item[:5]
+                    expires = expires /1e6  - 11644473600 # 1601/1/1
+                    value = self._decrypt(item[5], item[6], item[4], item[1], key=key)
+                    yield create_cookie(host, path, secure, expires, name, value)
+                con.close()
+
+    def _decrypt(self, value, encrypted_value, cookiename, sitename, key):
+
+        """Decrypt encoded cookies
+        """
+        if (sys.platform == 'darwin') or sys.platform.startswith('linux'):
+            if value or (encrypted_value[:3] != b'v10' and encrypted_value[:3] != b'v11'):
+                return value
+
+            # Encrypted cookies should be prefixed with 'v10' or 'v11' according to the
+            # Chromium code. Strip it off.
+            encrypted_value = encrypted_value[3:]
+
+            # Strip padding by taking off number indicated by padding
+            # eg if last is '\x0e' then ord('\x0e') == 14, so take off 14.
+            def clean(x):
+                last = x[-1]
+                if isinstance(last, int):
+                    return x[:-last].decode('utf8')
+                else:
+                    return x[:-ord(last)].decode('utf8')
+
+            iv = b' ' * 16
+            cipher = AES.new(key, AES.MODE_CBC, IV=iv)
+            decrypted = cipher.decrypt(encrypted_value)
+            return clean(decrypted)
+        else:
+            # Must be win32 (on win32, all chrome cookies are encrypted)
+
+            plaintext = ""
+            if encrypted_value[:3] == b'v10':
+                try:
+                    data = encrypted_value # the encrypted cookie
+                    nonce = data[3:3 + 12]
+                    ciphertext = data[3 + 12:-16]
+                    tag = data[-16:]
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")  # the decrypted cookie
+                except:
+                    raise BrowserCookieError("Error decrypting V80+ cookie: " + str(cookiename) + " from site " + str(sitename))
+            else:
+                try:
+                    plaintext = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode("utf-8")
+                except:
+                    raise BrowserCookieError("Error decrypting cookie: " + str(cookiename) + " from site " + str(sitename))
+            return plaintext
+
+
+class Chromium(BrowserCookieLoader):
+    def __str__(self):
+        return 'chromium'
+
+    def find_cookie_files(self):
+        for pattern in [
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Profile */Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Profile */Cookies'),
+            os.path.expanduser('~/.config/chromium/Default/Cookies'),
+            os.path.expanduser('~/.config/chromium/Profile */Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Default/Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Profile */Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Default/Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Profile */Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Network\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Profile *\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Profile *\Cookies'),
+        ]:
+            for result in glob.glob(pattern):
+                yield result
+
+    def get_cookies(self):
+        salt = b'saltysalt'
+        length = 16
+        if sys.platform == 'darwin':
+            # running Chrome on OSX
+            my_pass = keyring.get_password('Chrome Safe Storage', 'Chrome')
+            my_pass = my_pass.encode('utf8')
+            iterations = 1003
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform.startswith('linux'):
+            # running Chrome on Linux
+            my_pass = 'peanuts'.encode('utf8')
+            try:
+                import secretstorage
+
+                bus = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(bus)
+                for item in collection.get_all_items():
+                    if item.get_label() in ['Chromium Safe Storage', 'Chrome Safe Storage']:
+                        my_pass = item.get_secret()
+                        break
+            except Exception as e:
+                print(e)
+
+            iterations = 1
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform == 'win32':
+            path = r'%LocalAppData%\Google\Chrome\User Data\Local State'
+            path = os.path.expandvars(path)
+            with open(path, 'r') as file:
+                encrypted_key = json.loads(file.read())['os_crypt']['encrypted_key']
+            encrypted_key = base64.b64decode(encrypted_key)  # Base64 decoding
+            encrypted_key = encrypted_key[5:]  # Remove DPAPI
+            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]  # Decrypt key
+        else:
+            raise BrowserCookieError('Unsupported operating system: ' + sys.platform)
+
+        for cookie_file in self.cookie_files:
+            with create_local_copy(cookie_file) as tmp_cookie_file:
+                con = sqlite3.connect(tmp_cookie_file)
+                cur = con.cursor()
+                cur.execute('SELECT value FROM meta WHERE key = "version";')
+                version = int(cur.fetchone()[0])
+                query = 'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies;'
+                if version < 10:
+                    query = query.replace('is_', '')
+                cur.execute(query)
+                for item in cur.fetchall():
+                    host, path, secure, expires, name = item[:5]
+                    expires = expires /1e6  - 11644473600 # 1601/1/1
+                    value = self._decrypt(item[5], item[6], item[4], item[1], key=key)
+                    yield create_cookie(host, path, secure, expires, name, value)
+                con.close()
+
+    def _decrypt(self, value, encrypted_value, cookiename, sitename, key):
+
+        """Decrypt encoded cookies
+        """
+        if (sys.platform == 'darwin') or sys.platform.startswith('linux'):
+            if value or (encrypted_value[:3] != b'v10' and encrypted_value[:3] != b'v11'):
+                return value
+
+            # Encrypted cookies should be prefixed with 'v10' or 'v11' according to the
+            # Chromium code. Strip it off.
+            encrypted_value = encrypted_value[3:]
+
+            # Strip padding by taking off number indicated by padding
+            # eg if last is '\x0e' then ord('\x0e') == 14, so take off 14.
+            def clean(x):
+                last = x[-1]
+                if isinstance(last, int):
+                    return x[:-last].decode('utf8')
+                else:
+                    return x[:-ord(last)].decode('utf8')
+
+            iv = b' ' * 16
+            cipher = AES.new(key, AES.MODE_CBC, IV=iv)
+            decrypted = cipher.decrypt(encrypted_value)
+            return clean(decrypted)
+        else:
+            # Must be win32 (on win32, all chrome cookies are encrypted)
+
+            plaintext = ""
+            if encrypted_value[:3] == b'v10':
+                try:
+                    data = encrypted_value # the encrypted cookie
+                    nonce = data[3:3 + 12]
+                    ciphertext = data[3 + 12:-16]
+                    tag = data[-16:]
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")  # the decrypted cookie
+                except:
+                    raise BrowserCookieError("Error decrypting V80+ cookie: " + str(cookiename) + " from site " + str(sitename))
+            else:
+                try:
+                    plaintext = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode("utf-8")
+                except:
+                    raise BrowserCookieError("Error decrypting cookie: " + str(cookiename) + " from site " + str(sitename))
+            return plaintext
+
+
+class Opera(BrowserCookieLoader):
+    def __str__(self):
+        return 'edge'
+
+    def find_cookie_files(self):
+        for pattern in [
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Profile */Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Profile */Cookies'),
+            os.path.expanduser('~/.config/chromium/Default/Cookies'),
+            os.path.expanduser('~/.config/chromium/Profile */Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Default/Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Profile */Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Default/Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Profile */Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Network\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Profile *\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Profile *\Cookies'),
+        ]:
+            for result in glob.glob(pattern):
+                yield result
+
+    def get_cookies(self):
+        salt = b'saltysalt'
+        length = 16
+        if sys.platform == 'darwin':
+            # running Chrome on OSX
+            my_pass = keyring.get_password('Chrome Safe Storage', 'Chrome')
+            my_pass = my_pass.encode('utf8')
+            iterations = 1003
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform.startswith('linux'):
+            # running Chrome on Linux
+            my_pass = 'peanuts'.encode('utf8')
+            try:
+                import secretstorage
+
+                bus = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(bus)
+                for item in collection.get_all_items():
+                    if item.get_label() in ['Chromium Safe Storage', 'Chrome Safe Storage']:
+                        my_pass = item.get_secret()
+                        break
+            except Exception as e:
+                print(e)
+
+            iterations = 1
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform == 'win32':
+            path = r'%LocalAppData%\Google\Chrome\User Data\Local State'
+            path = os.path.expandvars(path)
+            with open(path, 'r') as file:
+                encrypted_key = json.loads(file.read())['os_crypt']['encrypted_key']
+            encrypted_key = base64.b64decode(encrypted_key)  # Base64 decoding
+            encrypted_key = encrypted_key[5:]  # Remove DPAPI
+            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]  # Decrypt key
+        else:
+            raise BrowserCookieError('Unsupported operating system: ' + sys.platform)
+
+        for cookie_file in self.cookie_files:
+            with create_local_copy(cookie_file) as tmp_cookie_file:
+                con = sqlite3.connect(tmp_cookie_file)
+                cur = con.cursor()
+                cur.execute('SELECT value FROM meta WHERE key = "version";')
+                version = int(cur.fetchone()[0])
+                query = 'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies;'
+                if version < 10:
+                    query = query.replace('is_', '')
+                cur.execute(query)
+                for item in cur.fetchall():
+                    host, path, secure, expires, name = item[:5]
+                    expires = expires /1e6  - 11644473600 # 1601/1/1
+                    value = self._decrypt(item[5], item[6], item[4], item[1], key=key)
+                    yield create_cookie(host, path, secure, expires, name, value)
+                con.close()
+
+    def _decrypt(self, value, encrypted_value, cookiename, sitename, key):
+
+        """Decrypt encoded cookies
+        """
+        if (sys.platform == 'darwin') or sys.platform.startswith('linux'):
+            if value or (encrypted_value[:3] != b'v10' and encrypted_value[:3] != b'v11'):
+                return value
+
+            # Encrypted cookies should be prefixed with 'v10' or 'v11' according to the
+            # Chromium code. Strip it off.
+            encrypted_value = encrypted_value[3:]
+
+            # Strip padding by taking off number indicated by padding
+            # eg if last is '\x0e' then ord('\x0e') == 14, so take off 14.
+            def clean(x):
+                last = x[-1]
+                if isinstance(last, int):
+                    return x[:-last].decode('utf8')
+                else:
+                    return x[:-ord(last)].decode('utf8')
+
+            iv = b' ' * 16
+            cipher = AES.new(key, AES.MODE_CBC, IV=iv)
+            decrypted = cipher.decrypt(encrypted_value)
+            return clean(decrypted)
+        else:
+            # Must be win32 (on win32, all chrome cookies are encrypted)
+
+            plaintext = ""
+            if encrypted_value[:3] == b'v10':
+                try:
+                    data = encrypted_value # the encrypted cookie
+                    nonce = data[3:3 + 12]
+                    ciphertext = data[3 + 12:-16]
+                    tag = data[-16:]
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")  # the decrypted cookie
+                except:
+                    raise BrowserCookieError("Error decrypting V80+ cookie: " + str(cookiename) + " from site " + str(sitename))
+            else:
+                try:
+                    plaintext = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode("utf-8")
+                except:
+                    raise BrowserCookieError("Error decrypting cookie: " + str(cookiename) + " from site " + str(sitename))
+            return plaintext
+
+
+class Brave(BrowserCookieLoader):
+    def __str__(self):
+        return 'brave'
+
+    def find_cookie_files(self):
+        for pattern in [
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Google/Chrome/Profile */Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Default/Cookies'),
+            os.path.expanduser('~/Library/Application Support/Vivaldi/Profile */Cookies'),
+            os.path.expanduser('~/.config/chromium/Default/Cookies'),
+            os.path.expanduser('~/.config/chromium/Profile */Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Default/Cookies'),
+            os.path.expanduser('~/.config/google-chrome/Profile */Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Default/Cookies'),
+            os.path.expanduser('~/.config/vivaldi/Profile */Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Default\Network\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Google\Chrome\User Data\Profile *\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Default\Cookies'),
+            os.path.join(os.getenv('APPDATA', ''), r'..\Local\Vivaldi\User Data\Profile *\Cookies'),
+        ]:
+            for result in glob.glob(pattern):
+                yield result
+
+    def get_cookies(self):
+        salt = b'saltysalt'
+        length = 16
+        if sys.platform == 'darwin':
+            # running Chrome on OSX
+            my_pass = keyring.get_password('Chrome Safe Storage', 'Chrome')
+            my_pass = my_pass.encode('utf8')
+            iterations = 1003
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform.startswith('linux'):
+            # running Chrome on Linux
+            my_pass = 'peanuts'.encode('utf8')
+            try:
+                import secretstorage
+
+                bus = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(bus)
+                for item in collection.get_all_items():
+                    if item.get_label() in ['Chromium Safe Storage', 'Chrome Safe Storage']:
+                        my_pass = item.get_secret()
+                        break
+            except Exception as e:
+                print(e)
+
+            iterations = 1
+            key = PBKDF2(my_pass, salt, length, iterations)
+
+        elif sys.platform == 'win32':
+            path = r'%LocalAppData%\Google\Chrome\User Data\Local State'
+            path = os.path.expandvars(path)
+            with open(path, 'r') as file:
+                encrypted_key = json.loads(file.read())['os_crypt']['encrypted_key']
+            encrypted_key = base64.b64decode(encrypted_key)  # Base64 decoding
+            encrypted_key = encrypted_key[5:]  # Remove DPAPI
+            key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]  # Decrypt key
+        else:
+            raise BrowserCookieError('Unsupported operating system: ' + sys.platform)
+
+        for cookie_file in self.cookie_files:
+            with create_local_copy(cookie_file) as tmp_cookie_file:
+                con = sqlite3.connect(tmp_cookie_file)
+                cur = con.cursor()
+                cur.execute('SELECT value FROM meta WHERE key = "version";')
+                version = int(cur.fetchone()[0])
+                query = 'SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies;'
+                if version < 10:
+                    query = query.replace('is_', '')
+                cur.execute(query)
+                for item in cur.fetchall():
+                    host, path, secure, expires, name = item[:5]
+                    expires = expires /1e6  - 11644473600 # 1601/1/1
+                    value = self._decrypt(item[5], item[6], item[4], item[1], key=key)
+                    yield create_cookie(host, path, secure, expires, name, value)
+                con.close()
+
+    def _decrypt(self, value, encrypted_value, cookiename, sitename, key):
+
+        """Decrypt encoded cookies
+        """
+        if (sys.platform == 'darwin') or sys.platform.startswith('linux'):
+            if value or (encrypted_value[:3] != b'v10' and encrypted_value[:3] != b'v11'):
+                return value
+
+            # Encrypted cookies should be prefixed with 'v10' or 'v11' according to the
+            # Chromium code. Strip it off.
+            encrypted_value = encrypted_value[3:]
+
+            # Strip padding by taking off number indicated by padding
+            # eg if last is '\x0e' then ord('\x0e') == 14, so take off 14.
+            def clean(x):
+                last = x[-1]
+                if isinstance(last, int):
+                    return x[:-last].decode('utf8')
+                else:
+                    return x[:-ord(last)].decode('utf8')
+
+            iv = b' ' * 16
+            cipher = AES.new(key, AES.MODE_CBC, IV=iv)
+            decrypted = cipher.decrypt(encrypted_value)
+            return clean(decrypted)
+        else:
+            # Must be win32 (on win32, all chrome cookies are encrypted)
+
+            plaintext = ""
+            if encrypted_value[:3] == b'v10':
+                try:
+                    data = encrypted_value # the encrypted cookie
+                    nonce = data[3:3 + 12]
+                    ciphertext = data[3 + 12:-16]
+                    tag = data[-16:]
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")  # the decrypted cookie
+                except:
+                    raise BrowserCookieError("Error decrypting V80+ cookie: " + str(cookiename) + " from site " + str(sitename))
+            else:
+                try:
+                    plaintext = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1].decode("utf-8")
+                except:
+                    raise BrowserCookieError("Error decrypting cookie: " + str(cookiename) + " from site " + str(sitename))
+            return plaintext
+
+
+class Chromium(BrowserCookieLoader):
+    def __str__(self):
+        return 'chromium'
 
     def find_cookie_files(self):
         for pattern in [
@@ -434,6 +1074,26 @@ def chrome(cookie_file=None):
     """Returns a cookiejar of the cookies used by Chrome
     """
     return Chrome(cookie_file).load()
+
+def edge(cookie_file=None):
+    """Returns a cookiejar of the cookies used by Microsoft Edge
+    """
+    return Edge(cookie_file).load()
+
+def opera(cookie_file=None):
+    """Returns a cookiejar of the cookies used by Opera
+    """
+    return Opera(cookie_file).load()
+
+def brave(cookie_file=None):
+    """Returns a cookiejar of the cookies used by Brave
+    """
+    return Brave(cookie_file).load()
+
+def chromium(cookie_file=None):
+    """Returns a cookiejar of the cookies used by Chromium
+    """
+    return Chromium(cookie_file).load()
 
 def firefox(cookie_file=None):
     """Returns a cookiejar of the cookies and sessions used by Firefox
